@@ -1,3 +1,4 @@
+import base64
 import io
 import os
 import json
@@ -70,7 +71,14 @@ async def generate_metadata_async(max_pages=40, existing_metadata=None, force_fu
     print("Checking for new chapters...")
     metadata = existing_metadata.get("metadata", {}).copy()
     ordered_slugs = existing_metadata.get("order", []).copy()
-    
+
+    # If chapter-0 is missing from ordered_slugs, force a full scan to self-heal
+    # truncated metadata (e.g. from earlier pagination bugs).
+    if "chapter-0" not in ordered_slugs:
+        force_full_scan = True
+
+    # Track all scanned slugs in order of discovery (newest to oldest)
+    scanned_slugs = []
     # Track new chapters found
     new_slugs = []
     async with async_playwright() as p:
@@ -149,6 +157,9 @@ async def generate_metadata_async(max_pages=40, existing_metadata=None, force_fu
                 
                 if item['isPaid']:
                     continue
+                
+                if slug not in scanned_slugs:
+                    scanned_slugs.append(slug)
                 
                 # Check for existing metadata first to prevent duplicates
                 # if slug in metadata:
@@ -262,9 +273,12 @@ async def generate_metadata_async(max_pages=40, existing_metadata=None, force_fu
                 new_links, all_known, first_slug = await extract_current_page()
                 
                 # If we have a previous slug to compare against, and they are the same,
-                # it means the page hasn't updated yet.
-                if current_page_first_slug and first_slug == current_page_first_slug and retries < 5:
-                    print(f"Page content hasn't changed yet, waiting... ({retries+1}/5)")
+                # or if 0 links were found (DOM still rendering transition), wait and retry.
+                if retries < 5 and (
+                    (current_page_first_slug and first_slug == current_page_first_slug) or
+                    (new_links == 0 and p_idx > 1)
+                ):
+                    print(f"Page content hasn't loaded or changed yet, waiting... ({retries+1}/5)")
                     await asyncio.sleep(2)
                     retries += 1
                     continue
@@ -289,16 +303,17 @@ async def generate_metadata_async(max_pages=40, existing_metadata=None, force_fu
                  break
 
             try:
+                chapters_panel = page.locator('div[role="tabpanel"][id*="-content-chapters_list"]')
                 next_page_num = str(p_idx + 1)
-                # Broader selector for pagination numbers
-                next_button = page.locator("li a, li button, button").filter(has_text=re.compile(f"^{next_page_num}$")).first
+                # First check chapters tab panel for the specific page number button
+                next_button = chapters_panel.locator("li a, li button, button, a").filter(has_text=re.compile(f"^{next_page_num}$")).first
                 if await next_button.is_visible():
                     await next_button.click()
                     # Initial wait for click to register
                     await asyncio.sleep(1)
                 else:
-                    # Broader selector for Next button
-                    next_button = page.locator("li a, li button, button, a").filter(has_text=re.compile(r"^>$|Next", re.I)).first
+                    # Broader selector for Next button strictly scoped inside chapters tab panel
+                    next_button = chapters_panel.locator("li a, li button, button, a").filter(has_text=re.compile(r"^>$|Next", re.I)).first
                     if await next_button.is_visible():
                         await next_button.click()
                         await asyncio.sleep(1)
@@ -313,9 +328,12 @@ async def generate_metadata_async(max_pages=40, existing_metadata=None, force_fu
                 
         await browser.close()
         
-    # Websites often list newest first. Chapter order should be oldest first for the EPUB.
-    # We prepended new ones (descending), so we need to reverse them and extend the old list.
-    if new_slugs:
+    # Websites list newest first. Chapter order must be oldest first for the EPUB.
+    if force_full_scan and scanned_slugs:
+        # Full scan was performed: rebuild ordered_slugs from all scanned slugs (reversed for oldest-first)
+        ordered_slugs = list(reversed(scanned_slugs))
+    elif new_slugs:
+        # Incremental scan: reverse new slugs and append to existing order
         new_slugs.reverse()
         ordered_slugs.extend(new_slugs)
     
@@ -437,7 +455,7 @@ def format_html_content(text):
     # Inner content allows:
     # 1. Any non-quote non-tag-start character: [^'<]
     # 2. An apostrophe that is sandwiched between word characters (e.g. don't, it's): (?<=\w)'(?=\w)
-    pattern_italic = r"(?<=[ >\n])'((?:[^'<]|(?<=\w)'(?=\w))+?)'(?=[ <.,;:!?\n])"
+    pattern_italic = r"(?<=[\s>(\[\"—\-])'((?:[^'<]|(?<=\w)'(?=\w))+?)'(?=[\s<.,;:!?\)\"\]—\-…])"
 
     # Use a callback to wrap in em tags
     text = re.sub(pattern_italic, r"<em>'\1'</em>", text)
@@ -642,16 +660,28 @@ async def worker(context, queue, chapters_data, semaphore):
                 print(f"Failed to generate {slug} after retries.")
         queue.task_done()
 
+def is_cjk_codepoint(cp):
+    """Return True if cp falls within common CJK Unicode blocks."""
+    return (0x3000 <= cp <= 0x9FFF or
+            0xF900 <= cp <= 0xFAFF or
+            0xFE10 <= cp <= 0xFE4F or
+            0xFF00 <= cp <= 0xFFEF)
+
 def collect_unicode_chars(book):
-    """Return a set of all Unicode codepoints used across all XHTML items in the book."""
-    chars = set()
+    """Return (all_chars, heading_cjk_chars) used across all XHTML items in the book."""
+    all_chars = set()
+    heading_cjk_chars = set()
     for item in book.items:
         if isinstance(item, epub.EpubHtml):
             content = item.content
             if isinstance(content, bytes):
                 content = content.decode('utf-8', errors='ignore')
-            chars.update(ord(c) for c in content)
-    return chars
+            all_chars.update(ord(c) for c in content)
+            # Collect CJK characters specifically appearing in headings or cjk-heading spans
+            for m in re.finditer(r'<span class="cjk-heading">([^<]+)</span>|<h[1-6][^>]*>(.*?)</h[1-6]>', content, re.DOTALL):
+                heading_text = m.group(1) or m.group(2) or ""
+                heading_cjk_chars.update(ord(c) for c in heading_text if is_cjk_codepoint(ord(c)))
+    return all_chars, heading_cjk_chars
 
 def subset_font(font_data, unicodes, flavor):
     """Subset font_data (bytes) to only the given unicode codepoints. Returns (bytes, warnings)."""
@@ -756,7 +786,7 @@ def embed_fonts(book, style_content):
         return style_content
 
     print("Subsetting fonts to only include characters used in the book...")
-    unicodes = collect_unicode_chars(book)
+    unicodes, heading_cjk_unicodes = collect_unicode_chars(book)
     if len(unicodes) == 0:
         print("  Warning: No characters collected — fonts will be subset to empty. Check that chapters are loaded before font embedding.")
     else:
@@ -764,13 +794,39 @@ def embed_fonts(book, style_content):
 
     # Map of Expected Filename in EPUB (from CSS) -> Possible local filenames
     desired_fonts = {
-        "Literata.ttf": ["Literata.ttf", "Literata-Regular.ttf", "Literata[opsz,wght].ttf"],
-        "FoglihtenNo07calt.otf": ["FoglihtenNo07calt.otf", "FoglihtenNo07.otf", "FoglihtenNo07.ttf", "FoglihtenNo07-Regular.otf"],
+        "OpenSans-Regular.ttf": ["OpenSans-Regular.ttf"],
+        "OpenSans-Bold.ttf": ["OpenSans-Bold.ttf"],
+        "OpenSans-Italic.ttf": ["OpenSans-Italic.ttf"],
+        "OpenSans-BoldItalic.ttf": ["OpenSans-BoldItalic.ttf"],
         "NotoSerifTC-Regular.ttf": ["NotoSerifTC-Regular.ttf", "NotoSerifTC.ttf"],
         "Huakang.ttf": ["Huakang.ttf", "Huakang running script.ttf", "DynaLab Huakang.ttf"],
     }
     
     for epub_name, candidate_names in desired_fonts.items():
+        if epub_name not in style_content and not any(c in style_content for c in candidate_names):
+            continue
+
+        # Target specific codepoints per font:
+        # - Huakang is only used for CJK in headings (.cjk-heading)
+        # - NotoSerifTC is used for CJK in body and fallback
+        # - OpenSans is used for Latin/ASCII text
+        if epub_name == "Huakang.ttf":
+            font_unicodes = heading_cjk_unicodes
+        elif epub_name == "NotoSerifTC-Regular.ttf":
+            font_unicodes = {cp for cp in unicodes if is_cjk_codepoint(cp)}
+        else:
+            font_unicodes = {cp for cp in unicodes if not is_cjk_codepoint(cp)}
+
+        if not font_unicodes:
+            print(f"  {epub_name} skipped (0 matching characters in book content)")
+            style_content = re.sub(
+                rf"@font-face\s*\{{[^}}]*?{re.escape(epub_name)}[^}}]*?\}}",
+                "",
+                style_content,
+                flags=re.DOTALL
+            )
+            continue
+
         found_path = None
         # 1. Try exact matches from candidate list
         for local_name in candidate_names:
@@ -794,15 +850,22 @@ def embed_fonts(book, style_content):
 
             original_kb = len(font_data) // 1024
             print(f"  {epub_name} ({original_kb}KB)...", end=" ", flush=True)
-            subsetted, ft_warnings = subset_font(font_data, unicodes, flavor=None)
+            subsetted, ft_warnings = subset_font(font_data, font_unicodes, flavor=None)
             result_kb = len(subsetted) // 1024
             if result_kb == 0:
-                print(f"subsetting failed — embedding full font ({original_kb}KB)")
+                print(f"subsetting resulted in 0KB — skipping font {epub_name}")
+                style_content = re.sub(
+                    rf"@font-face\s*\{{[^}}]*?{re.escape(epub_name)}[^}}]*?\}}",
+                    "",
+                    style_content,
+                    flags=re.DOTALL
+                )
                 if ft_warnings:
                     for line in ft_warnings.splitlines():
                         line = line.strip()
                         if line:
                             print(f"    Reason: {line}")
+                continue
             else:
                 font_data = subsetted
                 print(f"OK ({original_kb}KB -> {result_kb}KB)")
@@ -829,6 +892,14 @@ def embed_fonts(book, style_content):
             if actual_ext != expected_ext:
                 final_filename = os.path.splitext(epub_name)[0] + actual_ext
                 style_content = style_content.replace(epub_name, final_filename)
+
+            # Inline base64 data URI alongside file url so readers like LNReader
+            # (which import CSS but ignore the EPUB fonts/ folder) still load embedded fonts
+            b64_font = base64.b64encode(font_data).decode('ascii')
+            fmt = "opentype" if actual_ext == ".otf" else "truetype"
+            old_url = f"url('../fonts/{final_filename}') format('{fmt}')"
+            new_url = f"url('data:{mime};base64,{b64_font}') format('{fmt}'), {old_url}"
+            style_content = style_content.replace(old_url, new_url)
                 
             font_item = epub.EpubItem(
                 uid=f"font_{epub_name.replace('.', '_')}",
@@ -877,8 +948,12 @@ def embed_chapter_images(book, safe_slug, html_content):
     return html_content
 
 
-def create_epub(metadata_obj, chapters_data):
-    print("Generating EPUB...")
+def create_epub(metadata_obj, chapters_data, output_filename=None, style_path=None):
+    if output_filename is None:
+        output_filename = OUTPUT_EPUB
+    if style_path is None:
+        style_path = "style.css"
+    print(f"Generating EPUB ({output_filename})...")
     metadata = metadata_obj.get("metadata", {})
     ordered_slugs = metadata_obj.get("order", [])
     cover_image_url = metadata_obj.get("cover_image_url")
@@ -894,11 +969,10 @@ def create_epub(metadata_obj, chapters_data):
     cover_path = os.path.join(DATA_DIR, "cover.webp")
     if os.path.exists(cover_path):
         with open(cover_path, 'rb') as f:
-            book.set_cover("cover.webp", f.read())
+            book.set_cover("cover.webp", f.read(), create_page=False)
     elif cover_image_url:
         print("Warning: Cover image URL found but local image missing. Run without --force to potentially skip download if already existing (not applicable here), or check generation logs.")
 
-    style_path = "style.css"
     with open(style_path, 'r', encoding='utf-8') as f:
         style = f.read()
 
@@ -940,9 +1014,9 @@ def create_epub(metadata_obj, chapters_data):
     book.toc = tuple(chapters)
     book.add_item(epub.EpubNcx())
     book.add_item(epub.EpubNav())
-    book.spine = ['nav'] + chapters
-    epub.write_epub(OUTPUT_EPUB, book, {})
-    print(f"EPUB generated successfully: {OUTPUT_EPUB}")
+    book.spine = chapters
+    epub.write_epub(output_filename, book, {})
+    print(f"EPUB generated successfully: {output_filename}")
 
 def reencode_cover(cover_path):
     """Re-encode the cover in place at WebP quality 85 to cut file size
@@ -1072,6 +1146,10 @@ async def main(limit_indices=None, force_rebuild=False):
 
 if __name__ == "__main__":
     import sys
+    if hasattr(sys.stdout, "reconfigure"):
+        sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+    if hasattr(sys.stderr, "reconfigure"):
+        sys.stderr.reconfigure(encoding="utf-8", errors="replace")
     loop = asyncio.new_event_loop()
     asyncio.set_event_loop(loop)
     try:

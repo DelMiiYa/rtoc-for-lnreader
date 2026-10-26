@@ -3,6 +3,7 @@
 A Python script to generate an EPUB of ***A Regressor's Tale of Cultivation*** from [We Tried TLs](https://wetriedtls.com/series/a-regressors-tale-of-cultivation).
 
 ## Features
+- **LNReader Optimized**: Native integration with [LNReader](https://github.com/LNReader/lnreader) — full support for reader themes (Light, Dark, AMOLED), font size, line height, padding sliders, and the font picker, with inline base64 fonts and a clean spine without ghost chapters.
 - **Built for E-Readers**: Generates a clean EPUB with a book cover, Table of Contents, and metadata.
 - **Ad-Free Experience**: Automatically removes website clutter, pop-ups, and promotional text.
 - **Automatic Updates**: Run it once to get the whole book; run it again later to pick up only the newly released chapters.
@@ -66,8 +67,13 @@ python main.py
   ```
 
 ## Which E-Reader to use?
-The generated EPUB is standard and should work on any modern reader:
-- **Android**: I use [Moon+ Reader](http://www.moondownload.com/) (Free). Other great options include [ReadEra](https://readera.org/), [Librera](https://librera.mobi/), and [Lithium](https://play.google.com/store/apps/details?id=com.faultexception.reader). [Google Play Books](https://play.google.com/store/apps/details?id=com.google.android.apps.books) also works but has less features.
+The generated EPUB is standard EPUB 3 and works seamlessly across modern readers:
+- **[LNReader](https://github.com/LNReader/lnreader)** (Recommended):
+  - **Full UI Customization**: Adjust font size, line-height, horizontal padding, and colors freely without being overridden by EPUB styles.
+  - **Dynamic Theme Compatibility**: Adapts cleanly to Default, Dark, AMOLED, and custom themes (`opacity: 0.7` timestamps, responsive text).
+  - **Font Picker & Embedded Fonts**: Defaults to `Open Sans` (and `NotoSerifTC` for CJK characters), but cleanly yields when selecting custom fonts in LNReader's settings. Fonts are base64-inlined into `style/nav.css` so they render properly even though LNReader discards the EPUB `fonts/` folder on import.
+  - **Clean Spine**: No ghost chapters (no standalone `cover.xhtml` or `nav.xhtml` imported into your chapter list) while maintaining full EPUB 3 manifest compliance.
+- **Android**: [Moon+ Reader](http://www.moondownload.com/) (Free), [ReadEra](https://readera.org/), [Librera](https://librera.mobi/), and [Lithium](https://play.google.com/store/apps/details?id=com.faultexception.reader). [Google Play Books](https://play.google.com/store/apps/details?id=com.google.android.apps.books) also works.
 - **iOS/Mac**: The built-in **Apple Books** app handles these files perfectly.
 - **Kindle**: You can easily import the EPUB file using the [Send to Kindle](https://www.amazon.com/sendtokindle) service.
 

@@ -473,7 +473,7 @@ async def generate_chapter_content_async(context, url, slug, meta_title=None):
                 await page.close()
                 continue
                 
-            p_tags = container.find_all(['p', 'h1', 'h2', 'h3', 'h4', 'h5', 'h6', 'hr'])
+            p_tags = container.find_all(['p', 'h1', 'h2', 'h3', 'h4', 'h5', 'h6', 'hr', 'img'])
             ad_keywords = ["Discord", "Ko-fi", "Patreon", "Want more chapters", "Next chapter", "Previous chapter", "Consider supporting", "buymeacoffee", "TranslatingNovice", "Z0Rel", "BlueMangoAde", "wetriedtls"]
             
             title_pattern = ""
@@ -516,10 +516,16 @@ async def generate_chapter_content_async(context, url, slug, meta_title=None):
                             break
                 if found_title: break
             
+            # Content images live on the reaperscans CDN; anything else in the
+            # container (site chrome routed through the _next/image proxy) is skipped.
+            def is_content_image(tag):
+                src = tag.get('src') or ''
+                return 'media.reaperscans.net' in src and '_next/image' not in src
+
             cleaned_p_tags = []
             for p in p_tags:
                 text = p.get_text(" ", strip=True)
-                
+
                 # Check for critical split markers for the 807-808 case
                 is_split_marker = False
                 if slug == "chapter-807-808":
@@ -529,10 +535,16 @@ async def generate_chapter_content_async(context, url, slug, meta_title=None):
                 # If it contains an ad keyword, remove it, UNLESS it's a critical split marker
                 if any(kw.lower() in text.lower() for kw in ad_keywords) and not is_split_marker:
                     continue
-                
-                if not text and p.name != 'hr':
+
+                if p.name == 'img':
+                    if not is_content_image(p):
+                        continue
+                    # Skip images already embedded in a kept paragraph (avoid duplicates)
+                    if any(p in kept.find_all('img') for kept in cleaned_p_tags):
+                        continue
+                elif not text and p.name != 'hr':
                     continue
-                                    
+
                 cleaned_p_tags.append(p)
 
             # Apply textual cleanup to the valid tags in-place
@@ -830,6 +842,41 @@ def embed_fonts(book, style_content):
             
     return style_content
 
+def embed_chapter_images(book, safe_slug, html_content):
+    """Download remote <img> sources in a chapter's HTML, add them as EPUB items,
+    and rewrite src attributes to internal book paths. Returns updated HTML."""
+    img_srcs = re.findall(r'<img\b[^>]*\bsrc="(http[^"]+)"', html_content, re.I)
+    if not img_srcs:
+        return html_content
+
+    media_types = {'.png': 'image/png', '.jpg': 'image/jpeg', '.jpeg': 'image/jpeg',
+                   '.gif': 'image/gif', '.webp': 'image/webp', '.svg': 'image/svg+xml'}
+    with httpx.Client(follow_redirects=True, timeout=60) as client:
+        for n, src in enumerate(img_srcs):
+            try:
+                resp = client.get(src)
+                if resp.status_code != 200:
+                    print(f"  Warning: image download failed ({resp.status_code}): {src}")
+                    continue
+                data = resp.content
+            except Exception as e:
+                print(f"  Warning: image download error ({type(e).__name__}): {e}")
+                continue
+
+            ext = os.path.splitext(src.split('?')[0])[1].lower() or '.png'
+            media_type = media_types.get(ext, 'image/png')
+            fname = f"images/{safe_slug}_{n}{ext}"
+            book.add_item(epub.EpubItem(
+                uid=f"img_{safe_slug}_{n}",
+                file_name=fname,
+                media_type=media_type,
+                content=data
+            ))
+            html_content = html_content.replace(src, fname)
+            print(f"  Embedded image {fname} ({len(data) // 1024}KB)")
+    return html_content
+
+
 def create_epub(metadata_obj, chapters_data):
     print("Generating EPUB...")
     metadata = metadata_obj.get("metadata", {})
@@ -880,6 +927,7 @@ def create_epub(metadata_obj, chapters_data):
             safe_slug = re.sub(r'[^a-zA-Z0-9-]', '_', t_slug)
             ch_html = epub.EpubHtml(title=title, file_name=f'{safe_slug}.xhtml', lang='en')
             raw_html = f'<h1>{title}</h1><div class="date">Released: {release_date}</div>{content}'
+            raw_html = embed_chapter_images(book, safe_slug, raw_html)
             ch_html.content = wrap_cjk_spans(raw_html)
             ch_html.add_item(nav_css)
             book.add_item(ch_html)
@@ -895,6 +943,24 @@ def create_epub(metadata_obj, chapters_data):
     book.spine = ['nav'] + chapters
     epub.write_epub(OUTPUT_EPUB, book, {})
     print(f"EPUB generated successfully: {OUTPUT_EPUB}")
+
+def reencode_cover(cover_path):
+    """Re-encode the cover in place at WebP quality 85 to cut file size
+    without visible quality loss (e.g. 2.5MB -> ~274KB). Skips resizing —
+    the source is already below the ~1600px long-edge threshold."""
+    try:
+        from PIL import Image
+    except ImportError:
+        print("  Pillow not installed — skipping cover re-encode (pip install Pillow).")
+        return
+    try:
+        before = os.path.getsize(cover_path)
+        im = Image.open(cover_path)
+        im.save(cover_path, "WEBP", quality=85, method=6)
+        after = os.path.getsize(cover_path)
+        print(f"Cover re-encoded: {before // 1024}KB -> {after // 1024}KB")
+    except Exception as e:
+        print(f"  Warning: cover re-encode failed ({type(e).__name__}: {e}); keeping original.")
 
 async def main(limit_indices=None, force_rebuild=False):
     ensure_dirs()
@@ -995,6 +1061,7 @@ async def main(limit_indices=None, force_rebuild=False):
                         with open(cover_path, "wb") as f:
                             f.write(resp.content)
                         print("Cover image downloaded.")
+                        reencode_cover(cover_path)
                     else:
                         print(f"Failed to download cover image: Status {resp.status_code}")
             except Exception as e:
